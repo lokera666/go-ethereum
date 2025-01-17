@@ -17,10 +17,13 @@
 package params
 
 import (
+	"math"
 	"math/big"
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestCheckCompatible(t *testing.T) {
@@ -91,19 +94,19 @@ func TestCheckCompatible(t *testing.T) {
 			},
 		},
 		{
-			stored:        &ChainConfig{ShanghaiTime: big.NewInt(10)},
-			new:           &ChainConfig{ShanghaiTime: big.NewInt(20)},
+			stored:        &ChainConfig{ShanghaiTime: newUint64(10)},
+			new:           &ChainConfig{ShanghaiTime: newUint64(20)},
 			headTimestamp: 9,
 			wantErr:       nil,
 		},
 		{
-			stored:        &ChainConfig{ShanghaiTime: big.NewInt(10)},
-			new:           &ChainConfig{ShanghaiTime: big.NewInt(20)},
+			stored:        &ChainConfig{ShanghaiTime: newUint64(10)},
+			new:           &ChainConfig{ShanghaiTime: newUint64(20)},
 			headTimestamp: 25,
 			wantErr: &ConfigCompatError{
 				What:         "Shanghai fork timestamp",
-				StoredTime:   big.NewInt(10),
-				NewTime:      big.NewInt(20),
+				StoredTime:   newUint64(10),
+				NewTime:      newUint64(20),
 				RewindToTime: 9,
 			},
 		},
@@ -115,4 +118,40 @@ func TestCheckCompatible(t *testing.T) {
 			t.Errorf("error mismatch:\nstored: %v\nnew: %v\nheadBlock: %v\nheadTimestamp: %v\nerr: %v\nwant: %v", test.stored, test.new, test.headBlock, test.headTimestamp, err, test.wantErr)
 		}
 	}
+}
+
+func TestConfigRules(t *testing.T) {
+	c := &ChainConfig{
+		LondonBlock:  new(big.Int),
+		ShanghaiTime: newUint64(500),
+	}
+	var stamp uint64
+	if r := c.Rules(big.NewInt(0), true, stamp); r.IsShanghai {
+		t.Errorf("expected %v to not be shanghai", stamp)
+	}
+	stamp = 500
+	if r := c.Rules(big.NewInt(0), true, stamp); !r.IsShanghai {
+		t.Errorf("expected %v to be shanghai", stamp)
+	}
+	stamp = math.MaxInt64
+	if r := c.Rules(big.NewInt(0), true, stamp); !r.IsShanghai {
+		t.Errorf("expected %v to be shanghai", stamp)
+	}
+}
+
+func TestTimestampCompatError(t *testing.T) {
+	require.Equal(t, new(ConfigCompatError).Error(), "")
+
+	errWhat := "Shanghai fork timestamp"
+	require.Equal(t, newTimestampCompatError(errWhat, nil, newUint64(1681338455)).Error(),
+		"mismatching Shanghai fork timestamp in database (have timestamp nil, want timestamp 1681338455, rewindto timestamp 1681338454)")
+
+	require.Equal(t, newTimestampCompatError(errWhat, newUint64(1681338455), nil).Error(),
+		"mismatching Shanghai fork timestamp in database (have timestamp 1681338455, want timestamp nil, rewindto timestamp 1681338454)")
+
+	require.Equal(t, newTimestampCompatError(errWhat, newUint64(1681338455), newUint64(600624000)).Error(),
+		"mismatching Shanghai fork timestamp in database (have timestamp 1681338455, want timestamp 600624000, rewindto timestamp 600623999)")
+
+	require.Equal(t, newTimestampCompatError(errWhat, newUint64(0), newUint64(1681338455)).Error(),
+		"mismatching Shanghai fork timestamp in database (have timestamp 0, want timestamp 1681338455, rewindto timestamp 0)")
 }

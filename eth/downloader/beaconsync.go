@@ -19,12 +19,12 @@ package downloader
 import (
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/log"
 )
 
@@ -51,7 +51,8 @@ func newBeaconBackfiller(dl *Downloader, success func()) backfiller {
 }
 
 // suspend cancels any background downloader threads and returns the last header
-// that has been successfully backfilled.
+// that has been successfully backfilled (potentially in a previous run), or the
+// genesis.
 func (b *beaconBackfiller) suspend() *types.Header {
 	// If no filling is running, don't waste cycles
 	b.lock.Lock()
@@ -76,7 +77,7 @@ func (b *beaconBackfiller) suspend() *types.Header {
 
 	// Sync cycle was just terminated, retrieve and return the last filled header.
 	// Can't use `filled` as that contains a stale value from before cancellation.
-	return b.downloader.blockchain.CurrentFastBlock().Header()
+	return b.downloader.blockchain.CurrentSnapBlock()
 }
 
 // resume starts the downloader threads for backfilling state and chain data.
@@ -101,12 +102,12 @@ func (b *beaconBackfiller) resume() {
 		defer func() {
 			b.lock.Lock()
 			b.filling = false
-			b.filled = b.downloader.blockchain.CurrentFastBlock().Header()
+			b.filled = b.downloader.blockchain.CurrentSnapBlock()
 			b.lock.Unlock()
 		}()
 		// If the downloader fails, report an error as in beacon chain mode there
 		// should be no errors as long as the chain we're syncing to is valid.
-		if err := b.downloader.synchronise("", common.Hash{}, nil, nil, mode, true, b.started); err != nil {
+		if err := b.downloader.synchronise(mode, b.started); err != nil {
 			log.Error("Beacon backfilling failed", "err", err)
 			return
 		}
@@ -123,7 +124,8 @@ func (b *beaconBackfiller) resume() {
 func (b *beaconBackfiller) setMode(mode SyncMode) {
 	// Update the old sync mode and track if it was changed
 	b.lock.Lock()
-	updated := b.syncMode != mode
+	oldMode := b.syncMode
+	updated := oldMode != mode
 	filling := b.filling
 	b.syncMode = mode
 	b.lock.Unlock()
@@ -133,7 +135,7 @@ func (b *beaconBackfiller) setMode(mode SyncMode) {
 	if !updated || !filling {
 		return
 	}
-	log.Error("Downloader sync mode changed mid-run", "old", mode.String(), "new", mode.String())
+	log.Error("Downloader sync mode changed mid-run", "old", oldMode.String(), "new", mode.String())
 	b.suspend()
 	b.resume()
 }
@@ -151,8 +153,8 @@ func (d *Downloader) SetBadBlockCallback(onBadBlock badBlockFn) {
 //
 // Internally backfilling and state sync is done the same way, but the header
 // retrieval and scheduling is replaced.
-func (d *Downloader) BeaconSync(mode SyncMode, head *types.Header) error {
-	return d.beaconSync(mode, head, true)
+func (d *Downloader) BeaconSync(mode SyncMode, head *types.Header, final *types.Header) error {
+	return d.beaconSync(mode, head, final, true)
 }
 
 // BeaconExtend is an optimistic version of BeaconSync, where an attempt is made
@@ -162,7 +164,7 @@ func (d *Downloader) BeaconSync(mode SyncMode, head *types.Header) error {
 // This is useful if a beacon client is feeding us large chunks of payloads to run,
 // but is not setting the head after each.
 func (d *Downloader) BeaconExtend(mode SyncMode, head *types.Header) error {
-	return d.beaconSync(mode, head, false)
+	return d.beaconSync(mode, head, nil, false)
 }
 
 // beaconSync is the post-merge version of the chain synchronization, where the
@@ -171,7 +173,7 @@ func (d *Downloader) BeaconExtend(mode SyncMode, head *types.Header) error {
 //
 // Internally backfilling and state sync is done the same way, but the header
 // retrieval and scheduling is replaced.
-func (d *Downloader) beaconSync(mode SyncMode, head *types.Header, force bool) error {
+func (d *Downloader) beaconSync(mode SyncMode, head *types.Header, final *types.Header, force bool) error {
 	// When the downloader starts a sync cycle, it needs to be aware of the sync
 	// mode to use (full, snap). To keep the skeleton chain oblivious, inject the
 	// mode into the backfiller directly.
@@ -181,7 +183,7 @@ func (d *Downloader) beaconSync(mode SyncMode, head *types.Header, force bool) e
 	d.skeleton.filler.(*beaconBackfiller).setMode(mode)
 
 	// Signal the skeleton sync to switch to a new head, however it wants
-	if err := d.skeleton.Sync(head, force); err != nil {
+	if err := d.skeleton.Sync(head, final, force); err != nil {
 		return err
 	}
 	return nil
@@ -197,17 +199,17 @@ func (d *Downloader) findBeaconAncestor() (uint64, error) {
 	var chainHead *types.Header
 
 	switch d.getMode() {
-	case FullSync:
-		chainHead = d.blockchain.CurrentBlock().Header()
-	case SnapSync:
-		chainHead = d.blockchain.CurrentFastBlock().Header()
+	case ethconfig.FullSync:
+		chainHead = d.blockchain.CurrentBlock()
+	case ethconfig.SnapSync:
+		chainHead = d.blockchain.CurrentSnapBlock()
 	default:
-		chainHead = d.lightchain.CurrentHeader()
+		panic("unknown sync mode")
 	}
 	number := chainHead.Number.Uint64()
 
 	// Retrieve the skeleton bounds and ensure they are linked to the local chain
-	beaconHead, beaconTail, err := d.skeleton.Bounds()
+	beaconHead, beaconTail, _, err := d.skeleton.Bounds()
 	if err != nil {
 		// This is a programming error. The chain backfiller was called with an
 		// invalid beacon sync state. Ideally we would panic here, but erroring
@@ -217,12 +219,12 @@ func (d *Downloader) findBeaconAncestor() (uint64, error) {
 	}
 	var linked bool
 	switch d.getMode() {
-	case FullSync:
+	case ethconfig.FullSync:
 		linked = d.blockchain.HasBlock(beaconTail.ParentHash, beaconTail.Number.Uint64()-1)
-	case SnapSync:
+	case ethconfig.SnapSync:
 		linked = d.blockchain.HasFastBlock(beaconTail.ParentHash, beaconTail.Number.Uint64()-1)
 	default:
-		linked = d.blockchain.HasHeader(beaconTail.ParentHash, beaconTail.Number.Uint64()-1)
+		panic("unknown sync mode")
 	}
 	if !linked {
 		// This is a programming error. The chain backfiller was called with a
@@ -252,12 +254,12 @@ func (d *Downloader) findBeaconAncestor() (uint64, error) {
 
 		var known bool
 		switch d.getMode() {
-		case FullSync:
+		case ethconfig.FullSync:
 			known = d.blockchain.HasBlock(h.Hash(), n)
-		case SnapSync:
+		case ethconfig.SnapSync:
 			known = d.blockchain.HasFastBlock(h.Hash(), n)
 		default:
-			known = d.lightchain.HasHeader(h.Hash(), n)
+			panic("unknown sync mode")
 		}
 		if !known {
 			end = check
@@ -268,11 +270,11 @@ func (d *Downloader) findBeaconAncestor() (uint64, error) {
 	return start, nil
 }
 
-// fetchBeaconHeaders feeds skeleton headers to the downloader queue for scheduling
+// fetchHeaders feeds skeleton headers to the downloader queue for scheduling
 // until sync errors or is finished.
-func (d *Downloader) fetchBeaconHeaders(from uint64) error {
+func (d *Downloader) fetchHeaders(from uint64) error {
 	var head *types.Header
-	_, tail, err := d.skeleton.Bounds()
+	_, tail, _, err := d.skeleton.Bounds()
 	if err != nil {
 		return err
 	}
@@ -289,10 +291,13 @@ func (d *Downloader) fetchBeaconHeaders(from uint64) error {
 		localHeaders = d.readHeaderRange(tail, int(count))
 		log.Warn("Retrieved beacon headers from local", "from", from, "count", count)
 	}
+	fsHeaderContCheckTimer := time.NewTimer(fsHeaderContCheck)
+	defer fsHeaderContCheckTimer.Stop()
+
 	for {
 		// Some beacon headers might have appeared since the last cycle, make
 		// sure we're always syncing to all available ones
-		head, _, err = d.skeleton.Bounds()
+		head, _, _, err = d.skeleton.Bounds()
 		if err != nil {
 			return err
 		}
@@ -371,7 +376,7 @@ func (d *Downloader) fetchBeaconHeaders(from uint64) error {
 			continue
 		}
 		// If the pivot block is committed, signal header sync termination
-		if atomic.LoadInt32(&d.committed) == 1 {
+		if d.committed.Load() {
 			select {
 			case d.headerProcCh <- nil:
 				return nil
@@ -381,8 +386,9 @@ func (d *Downloader) fetchBeaconHeaders(from uint64) error {
 		}
 		// State sync still going, wait a bit for new headers and retry
 		log.Trace("Pivot not yet committed, waiting...")
+		fsHeaderContCheckTimer.Reset(fsHeaderContCheck)
 		select {
-		case <-time.After(fsHeaderContCheck):
+		case <-fsHeaderContCheckTimer.C:
 		case <-d.cancelCh:
 			return errCanceled
 		}

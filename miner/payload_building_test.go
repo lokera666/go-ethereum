@@ -17,16 +17,131 @@
 package miner
 
 import (
+	"math/big"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/beacon/engine"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/clique"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
-	"github.com/ethereum/go-ethereum/core/beacon"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/txpool"
+	"github.com/ethereum/go-ethereum/core/txpool/legacypool"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/params"
 )
+
+var (
+	// Test chain configurations
+	testTxPoolConfig  legacypool.Config
+	ethashChainConfig *params.ChainConfig
+	cliqueChainConfig *params.ChainConfig
+
+	// Test accounts
+	testBankKey, _  = crypto.GenerateKey()
+	testBankAddress = crypto.PubkeyToAddress(testBankKey.PublicKey)
+	testBankFunds   = big.NewInt(1000000000000000000)
+
+	testUserKey, _  = crypto.GenerateKey()
+	testUserAddress = crypto.PubkeyToAddress(testUserKey.PublicKey)
+
+	// Test transactions
+	pendingTxs []*types.Transaction
+	newTxs     []*types.Transaction
+
+	testConfig = Config{
+		PendingFeeRecipient: testBankAddress,
+		Recommit:            time.Second,
+		GasCeil:             params.GenesisGasLimit,
+	}
+)
+
+func init() {
+	testTxPoolConfig = legacypool.DefaultConfig
+	testTxPoolConfig.Journal = ""
+	ethashChainConfig = new(params.ChainConfig)
+	*ethashChainConfig = *params.TestChainConfig
+	cliqueChainConfig = new(params.ChainConfig)
+	*cliqueChainConfig = *params.TestChainConfig
+	cliqueChainConfig.Clique = &params.CliqueConfig{
+		Period: 10,
+		Epoch:  30000,
+	}
+
+	signer := types.LatestSigner(params.TestChainConfig)
+	tx1 := types.MustSignNewTx(testBankKey, signer, &types.AccessListTx{
+		ChainID:  params.TestChainConfig.ChainID,
+		Nonce:    0,
+		To:       &testUserAddress,
+		Value:    big.NewInt(1000),
+		Gas:      params.TxGas,
+		GasPrice: big.NewInt(params.InitialBaseFee),
+	})
+	pendingTxs = append(pendingTxs, tx1)
+
+	tx2 := types.MustSignNewTx(testBankKey, signer, &types.LegacyTx{
+		Nonce:    1,
+		To:       &testUserAddress,
+		Value:    big.NewInt(1000),
+		Gas:      params.TxGas,
+		GasPrice: big.NewInt(params.InitialBaseFee),
+	})
+	newTxs = append(newTxs, tx2)
+}
+
+// testWorkerBackend implements worker.Backend interfaces and wraps all information needed during the testing.
+type testWorkerBackend struct {
+	db      ethdb.Database
+	txPool  *txpool.TxPool
+	chain   *core.BlockChain
+	genesis *core.Genesis
+}
+
+func newTestWorkerBackend(t *testing.T, chainConfig *params.ChainConfig, engine consensus.Engine, db ethdb.Database, n int) *testWorkerBackend {
+	var gspec = &core.Genesis{
+		Config: chainConfig,
+		Alloc:  types.GenesisAlloc{testBankAddress: {Balance: testBankFunds}},
+	}
+	switch e := engine.(type) {
+	case *clique.Clique:
+		gspec.ExtraData = make([]byte, 32+common.AddressLength+crypto.SignatureLength)
+		copy(gspec.ExtraData[32:32+common.AddressLength], testBankAddress.Bytes())
+		e.Authorize(testBankAddress)
+	case *ethash.Ethash:
+	default:
+		t.Fatalf("unexpected consensus engine type: %T", engine)
+	}
+	chain, err := core.NewBlockChain(db, &core.CacheConfig{TrieDirtyDisabled: true}, gspec, nil, engine, vm.Config{}, nil)
+	if err != nil {
+		t.Fatalf("core.NewBlockChain failed: %v", err)
+	}
+	pool := legacypool.New(testTxPoolConfig, chain)
+	txpool, _ := txpool.New(testTxPoolConfig.PriceLimit, chain, []txpool.SubPool{pool})
+
+	return &testWorkerBackend{
+		db:      db,
+		chain:   chain,
+		txPool:  txpool,
+		genesis: gspec,
+	}
+}
+
+func (b *testWorkerBackend) BlockChain() *core.BlockChain { return b.chain }
+func (b *testWorkerBackend) TxPool() *txpool.TxPool       { return b.txPool }
+
+func newTestWorker(t *testing.T, chainConfig *params.ChainConfig, engine consensus.Engine, db ethdb.Database, blocks int) (*Miner, *testWorkerBackend) {
+	backend := newTestWorkerBackend(t, chainConfig, engine, db, blocks)
+	backend.txPool.Add(pendingTxs, true, true)
+	w := New(backend, testConfig, engine)
+	return w, backend
+}
 
 func TestBuildPayload(t *testing.T) {
 	var (
@@ -34,7 +149,6 @@ func TestBuildPayload(t *testing.T) {
 		recipient = common.HexToAddress("0xdeadbeef")
 	)
 	w, b := newTestWorker(t, params.TestChainConfig, ethash.NewFaker(), db, 0)
-	defer w.close()
 
 	timestamp := uint64(time.Now().Unix())
 	args := &BuildPayloadArgs{
@@ -43,25 +157,26 @@ func TestBuildPayload(t *testing.T) {
 		Random:       common.Hash{},
 		FeeRecipient: recipient,
 	}
-	payload, err := w.buildPayload(args)
+	payload, err := w.buildPayload(args, false)
 	if err != nil {
 		t.Fatalf("Failed to build payload %v", err)
 	}
-	verify := func(data *beacon.ExecutableDataV1, txs int) {
-		if data.ParentHash != b.chain.CurrentBlock().Hash() {
-			t.Fatal("Unexpect parent hash")
+	verify := func(outer *engine.ExecutionPayloadEnvelope, txs int) {
+		payload := outer.ExecutionPayload
+		if payload.ParentHash != b.chain.CurrentBlock().Hash() {
+			t.Fatal("Unexpected parent hash")
 		}
-		if data.Random != (common.Hash{}) {
-			t.Fatal("Unexpect random value")
+		if payload.Random != (common.Hash{}) {
+			t.Fatal("Unexpected random value")
 		}
-		if data.Timestamp != timestamp {
-			t.Fatal("Unexpect timestamp")
+		if payload.Timestamp != timestamp {
+			t.Fatal("Unexpected timestamp")
 		}
-		if data.FeeRecipient != recipient {
-			t.Fatal("Unexpect fee recipient")
+		if payload.FeeRecipient != recipient {
+			t.Fatal("Unexpected fee recipient")
 		}
-		if len(data.Transactions) != txs {
-			t.Fatal("Unexpect transaction set")
+		if len(payload.Transactions) != txs {
+			t.Fatal("Unexpected transaction set")
 		}
 	}
 	empty := payload.ResolveEmpty()
@@ -76,5 +191,82 @@ func TestBuildPayload(t *testing.T) {
 	dataTwo := payload.Resolve()
 	if !reflect.DeepEqual(dataOne, dataTwo) {
 		t.Fatal("Unexpected payload data")
+	}
+}
+
+func TestPayloadId(t *testing.T) {
+	t.Parallel()
+	ids := make(map[string]int)
+	for i, tt := range []*BuildPayloadArgs{
+		{
+			Parent:       common.Hash{1},
+			Timestamp:    1,
+			Random:       common.Hash{0x1},
+			FeeRecipient: common.Address{0x1},
+		},
+		// Different parent
+		{
+			Parent:       common.Hash{2},
+			Timestamp:    1,
+			Random:       common.Hash{0x1},
+			FeeRecipient: common.Address{0x1},
+		},
+		// Different timestamp
+		{
+			Parent:       common.Hash{2},
+			Timestamp:    2,
+			Random:       common.Hash{0x1},
+			FeeRecipient: common.Address{0x1},
+		},
+		// Different Random
+		{
+			Parent:       common.Hash{2},
+			Timestamp:    2,
+			Random:       common.Hash{0x2},
+			FeeRecipient: common.Address{0x1},
+		},
+		// Different fee-recipient
+		{
+			Parent:       common.Hash{2},
+			Timestamp:    2,
+			Random:       common.Hash{0x2},
+			FeeRecipient: common.Address{0x2},
+		},
+		// Different withdrawals (non-empty)
+		{
+			Parent:       common.Hash{2},
+			Timestamp:    2,
+			Random:       common.Hash{0x2},
+			FeeRecipient: common.Address{0x2},
+			Withdrawals: []*types.Withdrawal{
+				{
+					Index:     0,
+					Validator: 0,
+					Address:   common.Address{},
+					Amount:    0,
+				},
+			},
+		},
+		// Different withdrawals (non-empty)
+		{
+			Parent:       common.Hash{2},
+			Timestamp:    2,
+			Random:       common.Hash{0x2},
+			FeeRecipient: common.Address{0x2},
+			Withdrawals: []*types.Withdrawal{
+				{
+					Index:     2,
+					Validator: 0,
+					Address:   common.Address{},
+					Amount:    0,
+				},
+			},
+		},
+	} {
+		id := tt.Id().String()
+		if prev, exists := ids[id]; exists {
+			t.Errorf("ID collision, case %d and case %d: id %v", prev, i, id)
+		}
+		ids[id] = i
 	}
 }
