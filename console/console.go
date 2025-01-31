@@ -142,7 +142,6 @@ func (c *Console) init(preload []string) error {
 	// Add bridge overrides for web3.js functionality.
 	c.jsre.Do(func(vm *goja.Runtime) {
 		c.initAdmin(vm, bridge)
-		c.initPersonal(vm, bridge)
 	})
 
 	// Preload JavaScript files.
@@ -215,7 +214,7 @@ func (c *Console) initExtensions() error {
 	}
 
 	// Compute aliases from server-provided modules.
-	aliases := map[string]struct{}{"eth": {}, "personal": {}}
+	aliases := map[string]struct{}{"eth": {}}
 	for api := range apis {
 		if api == "web3" {
 			continue
@@ -247,29 +246,6 @@ func (c *Console) initAdmin(vm *goja.Runtime, bridge *bridge) {
 		admin.Set("sleep", jsre.MakeCallback(vm, bridge.Sleep))
 		admin.Set("clearHistory", c.clearHistory)
 	}
-}
-
-// initPersonal redirects account-related API methods through the bridge.
-//
-// If the console is in interactive mode and the 'personal' API is available, override
-// the openWallet, unlockAccount, newAccount and sign methods since these require user
-// interaction. The original web3 callbacks are stored in 'jeth'. These will be called
-// by the bridge after the prompt and send the original web3 request to the backend.
-func (c *Console) initPersonal(vm *goja.Runtime, bridge *bridge) {
-	personal := getObject(vm, "personal")
-	if personal == nil || c.prompter == nil {
-		return
-	}
-	jeth := vm.NewObject()
-	vm.Set("jeth", jeth)
-	jeth.Set("openWallet", personal.Get("openWallet"))
-	jeth.Set("unlockAccount", personal.Get("unlockAccount"))
-	jeth.Set("newAccount", personal.Get("newAccount"))
-	jeth.Set("sign", personal.Get("sign"))
-	personal.Set("openWallet", jsre.MakeCallback(vm, bridge.OpenWallet))
-	personal.Set("unlockAccount", jsre.MakeCallback(vm, bridge.UnlockAccount))
-	personal.Set("newAccount", jsre.MakeCallback(vm, bridge.NewAccount))
-	personal.Set("sign", jsre.MakeCallback(vm, bridge.Sign))
 }
 
 func (c *Console) clearHistory() {
@@ -305,12 +281,8 @@ func (c *Console) AutoCompleteInput(line string, pos int) (string, []string, str
 	start := pos - 1
 	for ; start > 0; start-- {
 		// Skip all methods and namespaces (i.e. including the dot)
-		if line[start] == '.' || (line[start] >= 'a' && line[start] <= 'z') || (line[start] >= 'A' && line[start] <= 'Z') {
-			continue
-		}
-		// Handle web3 in a special way (i.e. other numbers aren't auto completed)
-		if start >= 3 && line[start-3:start] == "web3" {
-			start -= 3
+		c := line[start]
+		if c == '.' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '1' && c <= '9') {
 			continue
 		}
 		// We've hit an unexpected character, autocomplete form here
@@ -328,9 +300,6 @@ func (c *Console) Welcome() {
 	// Print some generic Geth metadata
 	if res, err := c.jsre.Run(`
 		var message = "instance: " + web3.version.node + "\n";
-		try {
-			message += "coinbase: " + eth.coinbase + "\n";
-		} catch (err) {}
 		message += "at block: " + eth.blockNumber + " (" + new Date(1000 * eth.getBlock(eth.blockNumber).timestamp) + ")\n";
 		try {
 			message += " datadir: " + admin.datadir + "\n";

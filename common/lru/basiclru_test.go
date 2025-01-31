@@ -17,6 +17,7 @@
 package lru
 
 import (
+	crand "crypto/rand"
 	"fmt"
 	"io"
 	"math/rand"
@@ -169,6 +170,20 @@ func TestBasicLRUContains(t *testing.T) {
 	}
 }
 
+// Test that Peek doesn't update recent-ness
+func TestBasicLRUPeek(t *testing.T) {
+	cache := NewBasicLRU[int, int](2)
+	cache.Add(1, 1)
+	cache.Add(2, 2)
+	if v, ok := cache.Peek(1); !ok || v != 1 {
+		t.Errorf("1 should be set to 1")
+	}
+	cache.Add(3, 3)
+	if cache.Contains(1) {
+		t.Errorf("should not have updated recent-ness of 1")
+	}
+}
+
 func BenchmarkLRU(b *testing.B) {
 	var (
 		capacity = 1000
@@ -181,9 +196,9 @@ func BenchmarkLRU(b *testing.B) {
 	}
 	for i := range keys {
 		b := make([]byte, 32)
-		rand.Read(b)
+		crand.Read(b)
 		keys[i] = string(b)
-		rand.Read(b)
+		crand.Read(b)
 		values[i] = b
 	}
 
